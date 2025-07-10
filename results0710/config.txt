@@ -1,0 +1,16 @@
+seed: 42
+data_dir: ../../data
+output_dir: ../../a-testcode/EEG-Transformer/results0710
+batch_size: 16
+num_epochs: 100
+lr: 0.001
+weight_decay: 0.0001
+val_split: 0.15
+test_split: 0.15
+emb_size: 40
+depth: 4
+n_channels: 64
+n_samples: 2048
+early_stopping: {'patience': 5, 'min_delta': 0.001}
+lr_scheduler: {'name': 'ReduceLROnPlateau', 'params': {'factor': 0.5, 'patience': 3, 'threshold': 0.001, 'min_lr': 1e-06}}
+81226
