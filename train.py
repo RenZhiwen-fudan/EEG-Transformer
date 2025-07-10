@@ -5,9 +5,11 @@ import numpy as np
 import time
 import os
 from tqdm import tqdm
-from sklearn.metrics import classification_report, f1_score, confusion_matrix
+from sklearn.metrics import classification_report, f1_score, confusion_matrix, roc_auc_score
 import matplotlib.pyplot as plt
 import seaborn as sns
+import torch.distributed as dist
+import csv
 
 from dataloader import create_data_loaders
 from model import EEGTransformer
@@ -36,6 +38,17 @@ def train_model(config):
     # Create output directory
     os.makedirs(config['output_dir'], exist_ok=True)
     
+    # Create CSV file for saving epoch metrics
+    metrics_file = os.path.join(config['output_dir'], 'epoch_metrics.txt')
+    with open(metrics_file, 'w', newline='') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerow([
+            'Epoch', 'Train Loss', 'Val Loss', 'Test Loss', 
+            'Train Acc', 'Val Acc', 'Test Acc', 
+            'Test F1', 'Test AUCROC', 'Params LT (µs)', 
+            'Epoch Time (s)'
+        ])
+    
     # Create data loaders
     train_loader, val_loader, test_loader = create_data_loaders(
         config['data_dir'],
@@ -48,14 +61,26 @@ def train_model(config):
     
     # Initialize model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    num_gpus = torch.cuda.device_count()
+    print(f"Found {num_gpus} GPUs available")
+    
     model = EEGTransformer(
         emb_size=config['emb_size'],
         depth=config['depth'],
         n_classes=2,
-    ).to(device)
+    )
+    
+    # 使用DataParallel包装模型以支持多GPU
+    if num_gpus > 1:
+        print(f"Using {num_gpus} GPUs with DataParallel")
+        model = nn.DataParallel(model)
+    
+    model = model.to(device)
     
     # Print model info
-    print(f"Model parameters: {count_parameters(model)}")
+    num_params = count_parameters(model)
+    print(f"Model parameters: {num_params}")
     print(f"Using device: {device}")
     
     # Optimizer and loss function
@@ -64,7 +89,6 @@ def train_model(config):
         lr=config['lr'],
         weight_decay=config['weight_decay']
     )
-    # print(1)
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
@@ -74,7 +98,6 @@ def train_model(config):
         patience=5, 
         verbose=True
     )
-    # print(2)
     
     # Class weighting for imbalanced datasets
     # Count class occurrences in train dataset
@@ -108,8 +131,16 @@ def train_model(config):
     best_val_f1 = 0.0
     train_losses = []
     val_losses = []
+    test_losses = []  # 新增：存储每个epoch的测试集损失
     train_accs = []
     val_accs = []
+    test_accs = []  # 新增：存储每个epoch的测试集准确率
+    test_f1s = []   # 新增：存储每个epoch的测试集F1分数
+    test_aurocs = [] # 新增：存储每个epoch的测试集AUCROC
+    params_latencies = [] # 新增：存储每个epoch的参数延迟
+    
+    # Precalculate model parameters (will be constant)
+    num_params = count_parameters(model)
     
     # Start training
     print("\nStarting training...")
@@ -150,37 +181,96 @@ def train_model(config):
         # Update scheduler
         scheduler.step(val_f1)
         
-        # Save best model
+        # Evaluate on test set after each epoch
+        test_loss, test_acc, test_f1, test_aucroc = evaluate_model(model, test_loader, criterion, device)
+        test_losses.append(test_loss)
+        test_accs.append(test_acc)
+        test_f1s.append(test_f1)
+        test_aurocs.append(test_aucroc)
+        
+        # Measure inference latency
+        latency = measure_inference_latency(model, test_loader, device, num_inferences=100)
+        params_latencies.append(latency)
+        
+        print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | Test F1: {test_f1:.4f} | "
+              f"Test AUCROC: {test_aucroc:.4f} | Latency: {latency:.2f} µs")
+        
+        # Save best model based on validation F1
         if val_f1 > best_val_f1:
             best_val_f1 = val_f1
-            torch.save(model.state_dict(), os.path.join(config['output_dir'], 'best_model.pth'))
-            print(f"Saved new best model with F1: {val_f1:.4f}")
+            
+            # 关键修改：保存模型时处理DataParallel
+            if isinstance(model, nn.DataParallel):
+                # 如果是多GPU模型，只保存module部分
+                torch.save(model.module.state_dict(), os.path.join(config['output_dir'], 'best_model.pth'))
+            else:
+                torch.save(model.state_dict(), os.path.join(config['output_dir'], 'best_model.pth'))
+                
+            print(f"Saved new best model with Val F1: {val_f1:.4f}")
         
         epoch_time = time.time() - epoch_start
+        
+        # Save epoch metrics to TXT file
+        with open(metrics_file, 'a', newline='') as f:
+            writer = csv.writer(f, delimiter='\t')
+            writer.writerow([
+                epoch+1,
+                f"{train_loss:.6f}",
+                f"{val_loss:.6f}",
+                f"{test_loss:.6f}",
+                f"{train_acc:.6f}",
+                f"{val_acc:.6f}",
+                f"{test_acc:.6f}",
+                f"{test_f1:.6f}",
+                f"{test_aucroc:.6f}",
+                f"{latency:.6f}",
+                f"{epoch_time:.2f}"
+            ])
+        
         print(f"Epoch {epoch+1}/{config['num_epochs']} - {epoch_time:.1f}s")
         print(f"Train Loss: {train_loss:.4f} | Acc: {train_acc:.4f}")
         print(f"Val Loss: {val_loss:.4f} | Acc: {val_acc:.4f} | F1: {val_f1:.4f}")
+        print(f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | Test F1: {test_f1:.4f} | Test AUCROC: {test_aucroc:.4f} | Latency: {latency:.2f} µs")
     
     # Load best model
-    model.load_state_dict(torch.load(os.path.join(config['output_dir'], 'best_model.pth')))
-    print("Loaded best model for testing")
+    best_model_path = os.path.join(config['output_dir'], 'best_model.pth')
+    if isinstance(model, nn.DataParallel):
+        # 如果是多GPU模型，加载到module中
+        model.module.load_state_dict(torch.load(best_model_path))
+    else:
+        model.load_state_dict(torch.load(best_model_path))
+    
+    print("Loaded best model for final testing")
     
     # Final evaluation on test set
-    test_loss, test_acc, test_f1 = evaluate_model(model, test_loader, criterion, device)
+    test_loss, test_acc, test_f1, test_aucroc = evaluate_model(model, test_loader, criterion, device)
+    latency = measure_inference_latency(model, test_loader, device)
     print(f"\nFinal Test Results:")
-    print(f"Loss: {test_loss:.4f} | Accuracy: {test_acc:.4f} | F1 Score: {test_f1:.4f}")
+    print(f"Loss: {test_loss:.4f} | Accuracy: {test_acc:.4f} | F1 Score: {test_f1:.4f} | AUCROC: {test_aucroc:.4f} | Latency: {latency:.2f} µs")
     
     # Save training and validation metrics
     metrics = {
         'train_losses': train_losses,
         'val_losses': val_losses,
+        'test_losses': test_losses,
         'train_accs': train_accs,
         'val_accs': val_accs,
-        'test_loss': test_loss,
-        'test_acc': test_acc,
-        'test_f1': test_f1
+        'test_accs': test_accs,
+        'test_f1s': test_f1s,
+        'test_aurocs': test_aurocs,
+        'params_latencies': params_latencies,
+        'num_params': num_params,
+        'num_gpus_used': num_gpus  # 记录使用的GPU数量
     }
-    torch.save(metrics, os.path.join(config['output_dir'], 'metrics.pth'))
+    
+    # 保存为txt而不是pth
+    metrics_txt_file = os.path.join(config['output_dir'], 'final_metrics.txt')
+    with open(metrics_txt_file, 'w') as f:
+        for key, value in metrics.items():
+            if isinstance(value, list):
+                f.write(f"{key}: {','.join(map(str, value))}\n")
+            else:
+                f.write(f"{key}: {value}\n")
     
     # Plot confusion matrix for test set
     print("\nTest set performance:")
@@ -189,29 +279,71 @@ def train_model(config):
     plot_confusion_matrix(y_true, y_pred, ['Other', 'Trueictal'], 
                          os.path.join(config['output_dir'], 'confusion_matrix.png'))
     
-    # Plot training curves
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1)
+    # Plot training curves with test performance
+    plt.figure(figsize=(15, 8))
+    
+    # Loss Curve
+    plt.subplot(2, 3, 1)
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Val Loss')
+    plt.plot(test_losses, label='Test Loss', linestyle='--')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     plt.title('Loss Curve')
     
-    plt.subplot(1, 2, 2)
+    # Accuracy Curve
+    plt.subplot(2, 3, 2)
     plt.plot(train_accs, label='Train Acc')
     plt.plot(val_accs, label='Val Acc')
+    plt.plot(test_accs, label='Test Acc', linestyle='--')
     plt.xlabel('Epoch')
     plt.ylabel('Accuracy')
     plt.legend()
     plt.title('Accuracy Curve')
+    
+    # F1 Score Curve
+    plt.subplot(2, 3, 3)
+    plt.plot(test_f1s, label='Test F1', color='purple')
+    plt.xlabel('Epoch')
+    plt.ylabel('F1 Score')
+    plt.legend()
+    plt.title('Test F1 Score Curve')
+    
+    # AUCROC Curve
+    plt.subplot(2, 3, 4)
+    plt.plot(test_aurocs, label='Test AUCROC', color='green')
+    plt.xlabel('Epoch')
+    plt.ylabel('AUCROC')
+    plt.legend()
+    plt.title('Test AUCROC Curve')
+    
+    # Latency Curve
+    plt.subplot(2, 3, 5)
+    plt.plot(params_latencies, label='Inference Latency', color='red')
+    plt.xlabel('Epoch')
+    plt.ylabel('Latency (µs)')
+    plt.legend()
+    plt.title('Inference Latency')
+    
+    # Parameters
+    plt.subplot(2, 3, 6)
+    plt.text(0.1, 0.5, f"Model Parameters: {num_params}\nGPUs Used: {num_gpus}", 
+             fontsize=12, bbox=dict(facecolor='white', alpha=0.5))
+    plt.axis('off')
+    plt.title('Model Information')
+    
     plt.tight_layout()
     plt.savefig(os.path.join(config['output_dir'], 'training_curves.png'))
     plt.close()
     
     # Save the final model
-    torch.save(model.state_dict(), os.path.join(config['output_dir'], 'final_model.pth'))
+    if isinstance(model, nn.DataParallel):
+        # 如果是多GPU模型，只保存module部分
+        torch.save(model.module.state_dict(), os.path.join(config['output_dir'], 'final_model.pth'))
+    else:
+        torch.save(model.state_dict(), os.path.join(config['output_dir'], 'final_model.pth'))
+    
     print("\nTraining completed.")
 
 def evaluate_model(model, data_loader, criterion, device):
@@ -220,7 +352,7 @@ def evaluate_model(model, data_loader, criterion, device):
     correct = 0
     total = 0
     all_labels = []
-    all_preds = []
+    all_probs = []
     
     with torch.no_grad():
         for inputs, labels in data_loader:
@@ -231,23 +363,33 @@ def evaluate_model(model, data_loader, criterion, device):
             loss = criterion(outputs, labels)
             running_loss += loss.item()
             
+            # 获取预测概率
+            probs = torch.nn.functional.softmax(outputs, dim=1)
+            
+            # 收集预测结果
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
             
             # 确保张量正确转换
             all_labels.append(labels.cpu())  # 先移动回CPU
-            all_preds.append(predicted.cpu())
+            all_probs.append(probs.cpu())
     
     # 统一转换为NumPy数组
     all_labels = torch.cat(all_labels).numpy()
-    all_preds = torch.cat(all_preds).numpy()
+    all_probs = torch.cat(all_probs).numpy()
     
     avg_loss = running_loss / len(data_loader)
     accuracy = correct / total
-    f1 = f1_score(all_labels, all_preds, average='weighted')
+    f1 = f1_score(all_labels, np.argmax(all_probs, axis=1), average='weighted')
     
-    return avg_loss, accuracy, f1
+    # 计算AUC ROC
+    try:
+        aucroc = roc_auc_score(all_labels, all_probs[:, 1])
+    except:
+        aucroc = 0.5
+    
+    return avg_loss, accuracy, f1, aucroc
 
 def predict_model(model, data_loader, device):
     model.eval()
@@ -270,14 +412,62 @@ def predict_model(model, data_loader, device):
         torch.cat(all_preds).numpy()
     )
 
+def measure_inference_latency(model, data_loader, device, num_inferences=100):
+    """Measure average inference latency per sample in microseconds"""
+    model.eval()
+    latencies = []
+    
+    # Warmup
+    with torch.no_grad():
+        for i, (inputs, _) in enumerate(data_loader):
+            if i >= 10:  # 预热10个batch
+                break
+            inputs = inputs.to(device)
+            _ = model(inputs)
+    
+    # 实际测量
+    with torch.no_grad():
+        for i, (inputs, _) in enumerate(data_loader):
+            if i >= num_inferences:
+                break
+            inputs = inputs.to(device)
+            
+            # 确保异步CUDA操作完成
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+                
+            start_time = time.perf_counter()
+            _ = model(inputs)
+            
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+                
+            end_time = time.perf_counter()
+            
+            # 计算每个样本的延迟（转换为微秒）
+            batch_size = inputs.size(0)
+            latency_us = (end_time - start_time) * 1e6 / batch_size
+            latencies.append(latency_us)
+    
+    # 如果有多个GPU，平均延迟
+    if torch.cuda.device_count() > 1 and device.type == 'cuda':
+        avg_latency = sum(latencies) / len(latencies)
+        avg_tensor = torch.tensor(avg_latency).to(device)
+        dist.reduce(avg_tensor, dst=0, op=dist.ReduceOp.SUM)
+        avg_latency = avg_tensor.item() / dist.get_world_size()
+    else:
+        avg_latency = sum(latencies) / len(latencies)
+    
+    return avg_latency
+
 if __name__ == "__main__":
     # Configuration settings
     config = {
         'seed': 42,  # Random seed for reproducibility
         'data_dir': '../../data',  # Preprocessed data directory
-        'output_dir': '../../a-testcode/EEG-Transformer',  # Directory for output files
-        'batch_size': 8,
-        'num_epochs': 5,
+        'output_dir': '../../a-testcode/EEG-Transformer/results0710',  # Directory for output files
+        'batch_size': 16,  # 增加批次大小以充分利用多GPU
+        'num_epochs': 50,
         'lr': 0.0001,  # Learning rate
         'weight_decay': 1e-4,  # L2 regularization
         'val_split': 0.15,  # Validation set ratio
@@ -287,6 +477,15 @@ if __name__ == "__main__":
         'n_channels': 64,  # Number of EEG channels (adjust based on your data)
         'n_samples': 2048,  # EEG segment length in samples (4 seconds * 128 Hz = 512)
     }
+    
+    # 设置CUDA环境变量，确保所有GPU可见
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'  # 指定使用哪些GPU
+    
+    # 检查是否支持分布式训练
+    if 'WORLD_SIZE' in os.environ and int(os.environ['WORLD_SIZE']) > 1:
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        torch.cuda.set_device(local_rank)
     
     # Start training
     train_model(config)

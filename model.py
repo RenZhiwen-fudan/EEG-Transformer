@@ -35,7 +35,7 @@ class PatchEmbedding(nn.Module):
             self.position_embedding = nn.Parameter(
                 torch.randn(1, num_patches + 1, self.emb_size, device=device)
             )
-            print(f"动态创建位置编码: (1, {num_patches+1}, {self.emb_size}) on {device}")
+            # print(f"动态创建位置编码: (1, {num_patches+1}, {self.emb_size}) on {device}")
         
         cls_tokens = repeat(self.cls_token, '() n e -> b n e', b=b)
         x = torch.cat([cls_tokens, x], dim=1)

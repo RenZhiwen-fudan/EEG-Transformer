@@ -26,7 +26,7 @@ class EEGDataset(Dataset):
         self.transform = transform
         
         # 根据图片信息组织的数据结构
-        data_types = ["hup_ictal_win4x"] # "hup_interictal_win4"
+        data_types = ["hup_ictal_win4x","hup_interictal_win4"] # ,"hup_interictal_win4"
         
         # 统计总文件数量
         total_files = 0
