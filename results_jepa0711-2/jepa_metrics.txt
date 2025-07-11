@@ -1,0 +1,1 @@
+Epoch	Train Loss	Val Loss	Test Loss	Params LT (µs)	Epoch Time (s)	Learning Rate	Early Stopping

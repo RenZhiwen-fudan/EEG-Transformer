@@ -569,7 +569,7 @@ if __name__ == "__main__":
     config = {
         'seed': 42,  # Random seed for reproducibility
         'data_dir': '../../data',  # Preprocessed data directory
-        'output_dir': '../../a-testcode/EEG-Transformer/results0710',  # Directory for output files
+        'output_dir': '../../a-testcode/EEG-Transformer/results0711',  # Directory for output files
         'batch_size': 16,  # Batch size
         'num_epochs': 100,  # Total number of training epochs
         'lr': 0.001,  # Initial learning rate
