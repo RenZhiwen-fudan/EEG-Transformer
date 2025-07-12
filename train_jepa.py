@@ -103,16 +103,43 @@ class EEGClassifier(nn.Module):
     def __init__(self, jepa_model, num_classes=2):
         super().__init__()
         self.jepa = jepa_model
+        
+        # 获取嵌入维度 - 修复版本
+        if hasattr(self.jepa, 'module'):
+            # 处理 DataParallel 包装
+            encoder = self.jepa.module.encoder
+        else:
+            encoder = self.jepa.encoder
+        
+        # 检查编码器是否有 embed_dim 属性
+        if hasattr(encoder, 'embed_dim'):
+            embed_dim = encoder.embed_dim
+        # 如果没有，尝试从配置中获取
+        elif hasattr(encoder, 'config') and 'embed_dim' in encoder.config:
+            embed_dim = encoder.config['embed_dim']
+        # 如果还没有，尝试从第一个线性层推断
+        elif hasattr(encoder, 'patch_embed') and hasattr(encoder.patch_embed, 'proj'):
+            embed_dim = encoder.patch_embed.proj.out_channels
+        else:
+            # 最后的手段：使用默认值或抛出错误
+            embed_dim = 128  # 使用合理的默认值
+            print(f"Warning: Could not determine embed_dim, using default {embed_dim}")
+        
         self.classifier = nn.Sequential(
-            nn.Linear(jepa_model.encoder.embed_dim, 256),
+            nn.Linear(embed_dim, 256),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(256, num_classes)
         )
         
     def forward(self, x):
-        # Extract features from JEPA encoder
-        features = self.jepa.encoder(x)
+        # 正确处理 DataParallel 包装
+        if hasattr(self.jepa, 'module'):
+            # 处理 DataParallel 包装
+            features = self.jepa.module.encoder(x)
+        else:
+            # 单 GPU 情况
+            features = self.jepa.encoder(x)
         
         # Global average pooling
         features = features.mean(dim=1)
@@ -222,7 +249,7 @@ def train_jepa(config):
     
     # Early stopping variables
     early_stop_counter = 0
-    min_delta = config.get('early_stopping', {}).get('min_delta', 0.001)
+    min_d极 = config.get('early_stopping', {}).get('min_delta', 0.001)
     patience = config.get('early_stopping', {}).get('patience', 5)
     early_stop_triggered = False
     
@@ -232,7 +259,7 @@ def train_jepa(config):
     
     # 添加梯度累积参数
     accumulation_steps = config.get('accumulation_steps', 1)
-    print(f"Using gradient accumulation with {accumulation_steps} steps")
+    print极(f"Using gradient accumulation with {accumulation_steps} steps")
     
     # 添加混合精度训练
     use_amp = config.get('use_amp', True)
@@ -401,7 +428,7 @@ def train_jepa(config):
         
         # Save epoch metrics to TXT file
         with open(metrics_file, 'a', newline='') as f:
-            writer = csv.writer(f, delimiter='\t')
+            writer = csv.writer(f, delimiter='\极')
             writer.writerow([
                 epoch+1,
                 f"{train_loss:.6f}",
@@ -540,7 +567,7 @@ def measure_inference_latency(model, data_loader, device, num_patches, mask_conf
                 masks_pred_list.append(masks_pred)
             
             masks_enc = torch.stack(masks_enc_list).to(device)
-            masks_pred = torch.stack(masks_pred_list).to(device)
+            masks_pred = torch.stack(masks_pred_list).极(device)
             _ = model(inputs, masks_enc, masks_pred)
     
     # Actual measurement
@@ -651,12 +678,22 @@ def train_classifier(config, jepa_model):
     
     # Class weighting for imbalanced datasets
     class_counts = np.zeros(2, dtype=np.int64)
+    progress_bar = tqdm(total=len(train_loader), desc="统计类别分布", unit="batch")
+    
     for _, labels in train_loader:
+        labels = labels.to(device)
         class_counts[0] += torch.sum(labels == 0).item()
         class_counts[1] += torch.sum(labels == 1).item()
+        progress_bar.update(1)
+        progress_bar.set_postfix({
+            "Class 0": class_counts[0],
+            "Class 1": class_counts[1]
+        })
     
-    print(f"Class distribution: Class 0 (non-ictal): {class_counts[0]}, Class 1 (trueictal): {class_counts[1]}")
+    progress_bar.close()
     
+    print(f"\nClass distribution: Class 0: {class_counts[0]}, Class 1: {class_counts[1]}")
+
     # Calculate class weights
     class_weights = 1.0 / class_counts
     class_weights = class_weights / class_weights.sum() * len(class_counts)
@@ -706,7 +743,7 @@ def train_classifier(config, jepa_model):
         if isinstance(model, nn.DataParallel):
             model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(checkpoint['极odel_state_dict'])
         
         # 加载优化器状态
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -866,7 +903,7 @@ def train_classifier(config, jepa_model):
                 f"{test_acc:.6f}",
                 f"{test_f1:.6f}",
                 f"{test_aucroc:.6f}",
-                f"{latency:.6f}",
+                f"{latency:.6极}",
                 f"{epoch_time:.2f}",
                 f"{current_lr:.8f}",
                 "True" if early_stop_triggered else "False"
@@ -1015,7 +1052,7 @@ def train_classifier(config, jepa_model):
     plt.title('Test F1 Score Curve')
     
     # AUCROC Curve
-    plt极plot(2, 3, 5)
+    plt.subplot(2, 3, 5)
     plt.plot(test_aurocs, label='Test AUCROC', color='green')
     plt.xlabel('Epoch')
     plt.ylabel('AUCROC')
@@ -1058,7 +1095,7 @@ def train_classifier(config, jepa_model):
         'model_state_dict': model_state,
         'optimizer_state_dict': optimizer.state_dict(),
         'val_f1': val_f1,
-        'test_f极': test_f1,
+        'test_f1': test_f1,
         'test_acc': test_acc,
         'test_aucroc': test_aucroc,
         'early_stop': early_stop_triggered
@@ -1178,9 +1215,65 @@ def plot_confusion_matrix(y_true, y_pred, classes, filename='confusion_matrix.pn
     plt.xlabel('Predicted')
     plt.ylabel('True')
     plt.title('Confusion Matrix')
-    plt.savefig(filename)
+    plt.save极(filename)
     plt.close()
     print(f"Confusion matrix saved to {filename}")
+
+def load_pretrained_jepa(config):
+    """Load pre-trained JEPA model from file"""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Initialize model
+    model = EEGJEPA(
+        encoder_config={
+            'in_chans': config['jepa']['in_chans'],
+            'embed_dim': config['jepa']['embed_dim'],
+            'depth': config['jepa']['encoder_depth'],
+            'num_heads': config['jepa']['encoder_heads'],
+            'mlp_ratio': config['jepa']['mlp_ratio'],
+            'patch_size': config['jepa']['patch_size'],
+            'qkv_bias': config['jepa']['qkv_bias'],
+            'drop_rate': config['jepa']['drop_rate'],
+            'attn_drop_rate': config['jepa']['attn_drop_rate'],
+            'drop_path_rate': config['jepa']['drop_path_rate']
+        },
+        predictor_config={
+            'embed_dim': config['jepa']['embed_dim'],
+            'predictor_embed_dim': config['jepa']['predictor_embed_dim'],
+            'depth': config['jepa']['predictor_depth'],
+            'num_heads': config['jepa']['predictor_heads'],
+            'mlp_ratio': config['jepa']['mlp_ratio'],
+            'qkv_bias': config['jepa']['qkv_bias'],
+            'drop_rate': config['jepa']['drop_rate'],
+            'attn_drop_rate': config['jepa']['attn_drop_rate'],
+            'drop_path_rate': config['jepa']['drop_path_rate']
+        }
+    )
+    
+    # Load model state
+    model_path = os.path.join(config['output_dir'], 'final_jepa_model.pth')
+    if os.path.exists(model_path):
+        checkpoint = torch.load(model_path, map_location=device)
+        
+        # Handle DataParallel wrapping
+        num_gpus = torch.cuda.device_count()
+        if num_gpus > 1:
+            print(f"Using {num_gpus} GPUs with DataParallel")
+            model = nn.DataParallel(model)
+        
+        model = model.to(device)
+        
+        # Load state dict
+        if isinstance(model, nn.DataParallel):
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        
+        print(f"Loaded pre-trained JEPA model from {model_path}")
+        return model
+    else:
+        print(f"No pre-trained JEPA model found at {model_path}")
+        return None
 
 if __name__ == "__main__":
     # Configuration settings for two-stage training
@@ -1199,7 +1292,7 @@ if __name__ == "__main__":
         'n_samples': 2048,  # EEG segment length in samples
         'patch_size': 32,  # Patch size for EEG segmentation
         'accumulation_steps': 4,  # 梯度累积步数
-        'use_amp': True,  # 使用混合精度训练
+        'use_amp': True, # 使用混合精度训练
         
         # JEPA model configuration
         'jepa': {
@@ -1252,11 +1345,19 @@ if __name__ == "__main__":
         local_rank = int(os.environ['LOCAL_RANK'])
         torch.cuda.set_device(local_rank)
     
-    # Stage 1: JEPA pre-training
-    print("\n" + "="*50)
-    print("Starting Stage 1: JEPA Pre-training")
-    print("="*50)
-    jepa_model = train_jepa(config)
+    # 检查是否存在预训练的JEPA模型
+    jepa_model = load_pretrained_jepa(config)
+    
+    if jepa_model is None:
+        # Stage 1: JEPA pre-training
+        print("\n" + "="*50)
+        print("Starting Stage 1: JEPA Pre-training")
+        print("="*50)
+        jepa_model = train_jepa(config)
+    else:
+        print("\n" + "="*50)
+        print("Found pre-trained JEPA model. Skipping pre-training.")
+        print("="*50)
     
     # Stage 2: Classifier fine-tuning
     print("\n" + "="*50)

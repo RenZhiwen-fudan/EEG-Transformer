@@ -1,0 +1,19 @@
+seed: 42
+data_dir: ../../data
+output_dir: ../../a-testcode/EEG-Transformer/results_jepa0711-2
+batch_size: 8
+num_epochs: 100
+lr: 0.001
+classifier_lr: 0.0001
+weight_decay: 0.0001
+val_split: 0.15
+test_split: 0.15
+n_channels: 64
+n_samples: 2048
+patch_size: 32
+accumulation_steps: 4
+use_amp: True
+jepa: {'in_chans': 1, 'embed_dim': 128, 'encoder_depth': 4, 'encoder_heads': 8, 'predictor_embed_dim': 128, 'predictor_depth': 4, 'predictor_heads': 4, 'mlp_ratio': 4, 'patch_size': 32, 'qkv_bias': True, 'drop_rate': 0.1, 'attn_drop_rate': 0.1, 'drop_path_rate': 0.1}
+mask: {'min_keep': 10, 'max_keep': 100, 'allow_overlap': True}
+early_stopping: {'patience': 5, 'min_delta': 0.001}
+lr_scheduler: {'name': 'ReduceLROnPlateau', 'params': {'factor': 0.5, 'patience': 3, 'threshold': 0.001, 'min_lr': 1e-06}}
